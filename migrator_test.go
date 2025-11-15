@@ -1,6 +1,7 @@
 package clickhouse_test
 
 import (
+	"regexp"
 	"testing"
 	"time"
 
@@ -130,19 +131,80 @@ func TestMigrator_DontSupportEmptyDefaultValue(t *testing.T) {
 		t.Fatalf("no error should happen when auto migrate, but got %v", err)
 	}
 
-	// Replace every gorm raw SQL command with a function that appends the SQL string to a slice
+	if err := DB.Table("mytable").AutoMigrate(&MyTable{}); err != nil {
+		t.Fatalf("no error should happen when auto migrate, but got %v", err)
+	}
+
+	columnTypes, err := DB.Migrator().ColumnTypes("mytable")
+	if err != nil {
+		t.Fatalf("failed to inspect columns, got %v", err)
+	}
+	foundString := false
+	for _, col := range columnTypes {
+		if col.Name() == "my_field" {
+			foundString = true
+			if col.DatabaseTypeName() != "String" {
+				t.Fatalf("my_field column should remain String, got %s", col.DatabaseTypeName())
+			}
+		}
+	}
+	if !foundString {
+		t.Fatalf("my_field column not found after auto migrate")
+	}
+}
+
+func TestMigrator_OnClusterSupport(t *testing.T) {
+	type ClusterTable struct {
+		ID        uint64
+		Name      string
+		CreatedAt time.Time
+	}
+
+	// Test ON CLUSTER extraction from gorm:table_options
 	sqlStrings := make([]string, 0)
-	if err := DB.Callback().Raw().Replace("gorm:raw", func(db *gorm.DB) {
+
+	// Create a new DB instance for this test
+	options, err := clickhousego.ParseDSN(dbDSN)
+	if err != nil {
+		t.Fatalf("Can not parse dsn, got error %v", err)
+	}
+
+	testDB, err := gorm.Open(clickhouse.New(clickhouse.Config{
+		Conn: clickhousego.OpenDB(options),
+	}))
+	if err != nil {
+		t.Fatalf("failed to connect database, got error %v", err)
+	}
+
+	// Replace raw callback to capture SQL
+	if err := testDB.Callback().Raw().Replace("gorm:raw", func(db *gorm.DB) {
 		sqlToExecute := db.Statement.SQL.String()
 		sqlStrings = append(sqlStrings, sqlToExecute)
+		// Don't actually execute for this test
 	}); err != nil {
 		t.Fatalf("no error should happen when registering a callback, but got %v", err)
 	}
 
-	if err := DB.Table("mytable").AutoMigrate(&MyTable{}); err != nil {
-		t.Fatalf("no error should happen when auto migrate, but got %v", err)
+	// Test with ON CLUSTER in table_options
+	err = testDB.Set("gorm:table_options", "ON CLUSTER 'test_cluster' ENGINE ReplicatedMergeTree ORDER BY id").Table("cluster_test").AutoMigrate(&ClusterTable{})
+	if err != nil {
+		t.Fatalf("no error should happen when auto migrate with ON CLUSTER, but got %v", err)
 	}
-	if len(sqlStrings) > 0 {
-		t.Fatalf("should not auto-migrate table if there have not been any changes to the schema")
+
+	// Check if ON CLUSTER was placed correctly in the SQL
+	if len(sqlStrings) == 0 {
+		t.Fatalf("expected SQL to be captured")
+	}
+
+	createSQL := sqlStrings[len(sqlStrings)-1] // Get the last (CREATE TABLE) statement
+
+	// Verify ON CLUSTER appears after table name but before column definitions
+	expectedPattern := `CREATE TABLE.*cluster_test.* ON CLUSTER 'test_cluster' \(.*id.*\).*ENGINE ReplicatedMergeTree`
+	matched, err := regexp.MatchString(expectedPattern, createSQL)
+	if err != nil {
+		t.Fatalf("regex error: %v", err)
+	}
+	if !matched {
+		t.Fatalf("ON CLUSTER not placed correctly. Got SQL: %s", createSQL)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -24,6 +25,49 @@ var (
 type Migrator struct {
 	migrator.Migrator
 	Dialector
+}
+
+// isolateClusterOption splits ON CLUSTER clause from raw table options
+func isolateClusterOption(tableOpts string) (clusterOpts, cleanedOpts string) {
+	cleanedOpts = tableOpts
+	if tableOpts == "" {
+		return
+	}
+	re := regexp.MustCompile(`ON CLUSTER (?:'([^']+)'|([^\s]+))`)
+	clusterMatch := re.FindString(tableOpts)
+	if clusterMatch == "" {
+		return
+	}
+	clusterOpts = formatClusterClause(clusterMatch)
+	cleanedOpts = strings.TrimSpace(strings.Replace(tableOpts, clusterMatch, "", 1))
+	return
+}
+
+// formatClusterClause ensures ON CLUSTER clause begins with a single space and has no trailing space
+func formatClusterClause(cluster string) string {
+	clause := strings.TrimSpace(cluster)
+	if clause == "" {
+		return ""
+	}
+	if !strings.HasPrefix(clause, " ") {
+		clause = " " + clause
+	}
+	return clause
+}
+
+// extractClusterOption extracts ON CLUSTER clause from table options
+func (m Migrator) extractClusterOption() string {
+	// Extract ON CLUSTER from gorm:table_options
+	if tableOption, ok := m.DB.Get("gorm:table_options"); ok {
+		if clusterOpts, _ := isolateClusterOption(fmt.Sprint(tableOption)); clusterOpts != "" {
+			return clusterOpts
+		}
+	}
+	// Also support legacy gorm:table_cluster_options (for backward compatibility)
+	if clusterOption, ok := m.DB.Get("gorm:table_cluster_options"); ok {
+		return formatClusterClause(fmt.Sprint(clusterOption))
+	}
+	return ""
 }
 
 // Database
@@ -85,7 +129,7 @@ func (m Migrator) CreateTable(models ...interface{}) error {
 		tx := m.DB.Session(new(gorm.Session))
 		if err := m.RunWithValue(model, func(stmt *gorm.Statement) (err error) {
 			var (
-				createTableSQL = "CREATE TABLE ?%s(%s %s %s) %s"
+				createTableSQL = "CREATE TABLE ?%s (%s %s %s) %s"
 				args           = []interface{}{clause.Table{Name: stmt.Table}}
 			)
 
@@ -156,13 +200,20 @@ func (m Migrator) CreateTable(models ...interface{}) error {
 
 			// Step 4. Finally assemble CREATE TABLE ... SQL string
 			engineOpts := m.Dialector.DefaultTableEngineOpts
-			if tableOption, ok := m.DB.Get("gorm:table_options"); ok {
-				engineOpts = fmt.Sprint(tableOption)
+			tableOption, hasTableOption := m.DB.Get("gorm:table_options")
+			clusterOpts := ""
+			if hasTableOption {
+				tableOpts := fmt.Sprint(tableOption)
+				var cleanedOpts string
+				clusterOpts, cleanedOpts = isolateClusterOption(tableOpts)
+				engineOpts = cleanedOpts
 			}
 
-			clusterOpts := ""
+			// Also support legacy gorm:table_cluster_options (for backward compatibility)
 			if clusterOption, ok := m.DB.Get("gorm:table_cluster_options"); ok {
-				clusterOpts = " " + fmt.Sprint(clusterOption) + " "
+				if clusterOpts == "" {
+					clusterOpts = " " + fmt.Sprint(clusterOption) + " "
+				}
 			}
 
 			createTableSQL = fmt.Sprintf(createTableSQL, clusterOpts, columnStr, constrStr, indexStr, engineOpts)
@@ -218,11 +269,8 @@ func (m Migrator) GetTables() (tableList []string, err error) {
 func (m Migrator) AddColumn(value interface{}, field string) error {
 	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		if field := stmt.Schema.LookUpField(field); field != nil {
-			clusterOpts := ""
-			if clusterOption, ok := m.DB.Get("gorm:table_cluster_options"); ok {
-				clusterOpts = " " + fmt.Sprint(clusterOption) + " "
-			}
-			sQL := fmt.Sprintf("ALTER TABLE ? %s ADD COLUMN ? ?", clusterOpts)
+			clusterOpts := m.extractClusterOption()
+			sQL := fmt.Sprintf("ALTER TABLE ?%s ADD COLUMN ? ?", clusterOpts)
 			return m.DB.Exec(
 				sQL,
 				clause.Table{Name: stmt.Table}, clause.Column{Name: field.DBName},
@@ -238,11 +286,8 @@ func (m Migrator) DropColumn(value interface{}, name string) error {
 		if field := stmt.Schema.LookUpField(name); field != nil {
 			name = field.DBName
 		}
-		clusterOpts := ""
-		if clusterOption, ok := m.DB.Get("gorm:table_cluster_options"); ok {
-			clusterOpts = " " + fmt.Sprint(clusterOption) + " "
-		}
-		sQL := fmt.Sprintf("ALTER TABLE ? %s DROP COLUMN ?", clusterOpts)
+		clusterOpts := m.extractClusterOption()
+		sQL := fmt.Sprintf("ALTER TABLE ?%s DROP COLUMN ?", clusterOpts)
 		return m.DB.Exec(
 			sQL,
 			clause.Table{Name: stmt.Table}, clause.Column{Name: name},
@@ -253,11 +298,8 @@ func (m Migrator) DropColumn(value interface{}, name string) error {
 func (m Migrator) AlterColumn(value interface{}, field string) error {
 	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		if field := stmt.Schema.LookUpField(field); field != nil {
-			clusterOpts := ""
-			if clusterOption, ok := m.DB.Get("gorm:table_cluster_options"); ok {
-				clusterOpts = " " + fmt.Sprint(clusterOption) + " "
-			}
-			sQL := fmt.Sprintf("ALTER TABLE ? %s MODIFY COLUMN ? ?", clusterOpts)
+			clusterOpts := m.extractClusterOption()
+			sQL := fmt.Sprintf("ALTER TABLE ?%s MODIFY COLUMN ? ?", clusterOpts)
 			return m.DB.Exec(
 				sQL,
 				clause.Table{Name: stmt.Table},
@@ -284,11 +326,8 @@ func (m Migrator) RenameColumn(value interface{}, oldName, newName string) error
 				field = f
 			}
 			if field != nil {
-				clusterOpts := ""
-				if clusterOption, ok := m.DB.Get("gorm:table_cluster_options"); ok {
-					clusterOpts = " " + fmt.Sprint(clusterOption) + " "
-				}
-				sQL := fmt.Sprintf("ALTER TABLE ? %s RENAME COLUMN ? TO ?", clusterOpts)
+				clusterOpts := m.extractClusterOption()
+				sQL := fmt.Sprintf("ALTER TABLE ?%s RENAME COLUMN ? TO ?", clusterOpts)
 				return m.DB.Exec(
 					sQL,
 					clause.Table{Name: stmt.Table},
